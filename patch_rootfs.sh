@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Enhanced patch script for Shimboot, with additional support for audio firmware
+# Advanced patch script for Shimboot rootfs
+# Designed to integrate essential audio firmware for compatibility with target hardware.
 
 . ./common.sh
 . ./image_utils.sh
@@ -10,32 +11,55 @@ print_help() {
 }
 
 assert_root
-assert_deps "git gunzip depmod lsof"
+assert_deps "git gunzip depmod xz"
 assert_args "$3"
 
-copy_modules_and_firmware() {
-  local shim_rootfs=$(realpath -m $1)
-  local reco_rootfs=$(realpath -m $2)
-  local target_rootfs=$(realpath -m $3)
+# Identify relevant audio hardware from recovery image
+identify_audio_hardware() {
+  echo "Scanning recovery image for audio hardware details..."
+  local reco_rootfs=$1
+  local device_info=$(cat "${reco_rootfs}/proc/asound/cards" 2>/dev/null || lspci | grep -i audio)
 
-  echo "Copying kernel modules and firmware from shim and recovery images..."
+  if [ -z "$device_info" ]; then
+    echo "Warning: No audio hardware detected in recovery image."
+  else
+    echo "Audio hardware identified: $device_info"
+  fi
+  echo "$device_info"
+}
 
-  # Replace kernel modules
+# Copy and validate firmware files
+copy_and_prepare_firmware() {
+  local source_firmware_paths=("$1" "$2")
+  local target_rootfs=$3
+  local target_firmware_dir="${target_rootfs}/lib/firmware"
+
+  echo "Copying audio firmware to target rootfs..."
+  mkdir -p "$target_firmware_dir"
+
+  for path in "${source_firmware_paths[@]}"; do
+    if [ -d "$path" ]; then
+      echo "Processing firmware in $path..."
+      find "$path" -type f \( -name "*audio*" -o -name "*dsp*" -o -name "*codec*" \) -exec cp --remove-destination {} "$target_firmware_dir/" \;
+    fi
+  done
+
+  echo "Compressing firmware files..."
+  find "$target_firmware_dir" -type f -exec xz -T0 {} \;
+
+  echo "Firmware preparation complete."
+}
+
+# Copy kernel modules
+copy_kernel_modules() {
+  local source_rootfs=$1
+  local target_rootfs=$2
+
+  echo "Copying kernel modules..."
   rm -rf "${target_rootfs}/lib/modules"
-  cp -r "${shim_rootfs}/lib/modules" "${target_rootfs}/lib/modules"
+  cp -r "${source_rootfs}/lib/modules" "${target_rootfs}/lib/modules"
 
-  # Merge firmware from shim and recovery images
-  mkdir -p "${target_rootfs}/lib/firmware"
-  cp -r --remove-destination "${shim_rootfs}/lib/firmware/"* "${target_rootfs}/lib/firmware/"
-  cp -r --remove-destination "${reco_rootfs}/lib/firmware/"* "${target_rootfs}/lib/firmware/"
-
-  # Add modprobe configurations
-  mkdir -p "${target_rootfs}/lib/modprobe.d/" "${target_rootfs}/etc/modprobe.d/"
-  cp -r --remove-destination "${reco_rootfs}/lib/modprobe.d/"* "${target_rootfs}/lib/modprobe.d/" 2>/dev/null || true
-  cp -r --remove-destination "${reco_rootfs}/etc/modprobe.d/"* "${target_rootfs}/etc/modprobe.d/" 2>/dev/null || true
-
-  # Decompress kernel modules if required
-  echo "Decompressing kernel modules if needed..."
+  echo "Decompressing kernel modules if necessary..."
   find "${target_rootfs}/lib/modules" -name '*.gz' -exec gunzip {} \;
   for kernel_dir in "${target_rootfs}/lib/modules/"*; do
     local version=$(basename "$kernel_dir")
@@ -43,19 +67,21 @@ copy_modules_and_firmware() {
   done
 }
 
-fetch_audio_firmware() {
-  local target_rootfs=$(realpath -m $1)
+# Fetch and integrate additional firmware
+fetch_additional_firmware() {
+  local target_firmware_dir="${1}/lib/firmware"
   local firmware_repo="https://chromium.googlesource.com/chromiumos/third_party/linux-firmware"
-  local temp_firmware_dir="/tmp/audio-firmware"
+  local temp_dir="/tmp/audio-firmware"
 
-  echo "Fetching additional audio firmware..."
-  rm -rf "$temp_firmware_dir"
-  git clone --depth=1 "$firmware_repo" "$temp_firmware_dir"
+  echo "Fetching additional firmware from Chromium repository..."
+  rm -rf "$temp_dir"
+  git clone --depth=1 "$firmware_repo" "$temp_dir"
 
-  cp -r --remove-destination "${temp_firmware_dir}/"* "${target_rootfs}/lib/firmware/"
-  rm -rf "$temp_firmware_dir"
+  cp -r --remove-destination "${temp_dir}/"* "$target_firmware_dir/"
+  rm -rf "$temp_dir"
 }
 
+# Main Script Workflow
 shim_path=$(realpath -m $1)
 reco_path=$(realpath -m $2)
 target_rootfs=$(realpath -m $3)
@@ -70,11 +96,17 @@ echo "Mounting recovery rootfs..."
 reco_loop=$(create_loop "$reco_path")
 safe_mount "${reco_loop}p3" "$reco_rootfs" ro
 
-echo "Copying kernel modules and firmware..."
-copy_modules_and_firmware "$shim_rootfs" "$reco_rootfs" "$target_rootfs"
+echo "Identifying audio hardware..."
+identify_audio_hardware "$reco_rootfs"
 
-echo "Fetching and applying additional audio firmware..."
-fetch_audio_firmware "$target_rootfs"
+echo "Copying kernel modules..."
+copy_kernel_modules "$shim_rootfs" "$target_rootfs"
+
+echo "Copying and preparing firmware..."
+copy_and_prepare_firmware "$shim_rootfs/lib/firmware" "$reco_rootfs/lib/firmware" "$target_rootfs"
+
+echo "Fetching and integrating additional firmware..."
+fetch_additional_firmware "$target_rootfs"
 
 echo "Cleaning up..."
 umount "$shim_rootfs"
@@ -82,4 +114,4 @@ umount "$reco_rootfs"
 losetup -d "$shim_loop"
 losetup -d "$reco_loop"
 
-echo "Patch complete. Rootfs updated with audio support."
+echo "Patch process complete. Audio firmware integrated for Shimboot."
